@@ -57,7 +57,9 @@ def list_items_for_staff(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         SELECT i.*,
                (SELECT COUNT(*) FROM claims c WHERE c.item_id = i.id) AS claim_count,
                (SELECT COUNT(*) FROM claims c
-                 WHERE c.item_id = i.id AND c.status = 'pending') AS pending_count
+                 WHERE c.item_id = i.id AND c.status = 'pending') AS pending_count,
+               EXISTS (SELECT 1 FROM item_not_found nf
+                        WHERE nf.item_id = i.id AND nf.resolved_at IS NULL) AS not_found
         FROM items i
         ORDER BY i.id DESC
         """
@@ -149,7 +151,9 @@ def get_claim_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row | No
         """
         SELECT c.*, i.public_description AS item_description, i.status AS item_status,
                EXISTS (SELECT 1 FROM claims c2
-                        WHERE c2.item_id = i.id AND c2.status = 'selected') AS item_has_selected
+                        WHERE c2.item_id = i.id AND c2.status = 'selected') AS item_has_selected,
+               EXISTS (SELECT 1 FROM item_not_found nf
+                        WHERE nf.item_id = i.id AND nf.resolved_at IS NULL) AS item_not_found
         FROM claims c JOIN items i ON i.id = c.item_id
         WHERE c.token_hash = ?
         """,
@@ -413,6 +417,12 @@ def merge_items(
             "UPDATE return_revocations SET item_id = ? WHERE item_id = ?",
             (keep_item_id, merged_item_id),
         )
+        # 并入物品的「暂未找到」记录同样归到保留物品；保留物品在全部未解除记录
+        # 逐条复核解除前继续暂停交还（含本条与并入条带来的未解除记录）。
+        conn.execute(
+            "UPDATE item_not_found SET item_id = ? WHERE item_id = ?",
+            (keep_item_id, merged_item_id),
+        )
         # 合计仅一份获选：其他待核对申请标记未获选（与选定逻辑一致）
         winner_id = None
         if keep_selected or victim_selected:
@@ -572,10 +582,20 @@ def consume_code(conn: sqlite3.Connection, code: str) -> dict[str, Any]:
             return {"ok": False, "reason": "该交还码已使用，不能重复核销"}
         if hc["invalidated_at"] is not None:
             return {"ok": False, "reason": "该交还码已失效（已重发新码或认领已改判）"}
-        if hc["expires_at"] < ts:
-            return {"ok": False, "reason": "该交还码已过期，请为获选人重发新码"}
         if hc["item_status"] != "kept" or hc["claim_status"] != "selected":
             return {"ok": False, "reason": "物品或认领状态异常，无法交还"}
+        # 物品存在未解除的「暂未找到」记录：核码一律拒绝，且不消耗原码。
+        # 该判断先于过期判断：暂缓期间即使原码恰好过期，也统一以暂缓交还拒绝
+        # （原码不被消耗；解除后过期码再按现有重发规则处理）。
+        not_found = conn.execute(
+            "SELECT 1 FROM item_not_found WHERE item_id = ? AND resolved_at IS NULL LIMIT 1",
+            (hc["item_id"],),
+        ).fetchone()
+        if not_found is not None:
+            return {"ok": False,
+                    "reason": "该物品盘点暂未找到实物，正暂缓交还，不能核码（原交还码未消耗）"}
+        if hc["expires_at"] < ts:
+            return {"ok": False, "reason": "该交还码已过期，请为获选人重发新码"}
         cur = conn.execute(
             "UPDATE handover_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
             (ts, hc["id"]),
@@ -721,5 +741,121 @@ def list_return_revocations_for_item(conn: sqlite3.Connection, item_id: int) -> 
         WHERE rr.item_id = ?
         ORDER BY rr.id ASC
         """,
+        (item_id,),
+    ).fetchall()
+
+
+# ----------------------------------------------------------------- 盘点暂未找到（暂缓交还）
+
+def item_has_pending_not_found(conn: sqlite3.Connection, item_id: int) -> bool:
+    """物品当前是否存在未解除的「暂未找到」记录（即暂缓交还中）。"""
+    return conn.execute(
+        "SELECT 1 FROM item_not_found WHERE item_id = ? AND resolved_at IS NULL LIMIT 1",
+        (item_id,),
+    ).fetchone() is not None
+
+
+def register_not_found(conn: sqlite3.Connection, item_id: int, reason: str) -> int:
+    """盘点时登记物品暂未找到实物：填写必填原因后该物品暂停交还。
+
+    仅在下列条件全部于同一 IMMEDIATE 事务内核验通过时执行，任一不满足均拒绝且
+    不改动任何数据：
+      - 物品存在且当前为 kept（保管中）：已撤下、已交还、已并入均不得登记；
+      - 登记原因非空；
+      - 该物品不存在另一条未解除记录（重复登记拒绝；撤下再恢复不清除未找到状态）。
+
+    登记不改动物品状态、获选资格、申请归属与交还码有效期。
+    返回新记录 id。
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("未找到原因不能为空")
+    ts = now_iso()
+    with immediate_tx(conn):
+        item = conn.execute(
+            "SELECT id, status FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if item is None:
+            raise LookupError("物品不存在")
+        if item["status"] != "kept":
+            raise ValueError("仅保管中的物品可以登记暂未找到（已撤下、已交还、已并入均不可登记）")
+        if item_has_pending_not_found(conn, item_id):
+            raise ValueError("该物品已有未解除的暂未找到登记，不能重复登记")
+        cur = conn.execute(
+            "INSERT INTO item_not_found (item_id, reason, created_at) VALUES (?, ?, ?)",
+            (item_id, reason, ts),
+        )
+        nf_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE items SET updated_at = ? WHERE id = ? AND status = 'kept'",
+            (ts, item_id),
+        )
+    return nf_id
+
+
+def resolve_not_found(
+    conn: sqlite3.Connection, item_id: int, record_id: int, found_note: str
+) -> dict[str, Any]:
+    """找到实物后填写必填复核说明，逐条解除暂未找到登记。
+
+    仅在下列条件全部于同一 IMMEDIATE 事务内核验通过时执行，任一不满足均拒绝且
+    不改动任何数据：
+      - 复核说明非空；
+      - 记录存在、确属该物品（记录与物品不匹配拒绝）、且尚未解除（重复解除拒绝）；
+      - 物品当前不是已交还 / 已并入（撤下期间允许解除；与撤下、改判、合并、核码
+        等并发导致条件变化时按提交时最新状态核对）。
+
+    解除只置位本条记录的 found_note 与 resolved_at；同一物品若还有其他未解除
+    记录（例如合并并入条带过来的），物品仍继续暂缓交还，直至逐条复核解除。
+    未过期原码在全部解除后重新可见、可核销；码的有效期与获选资格自始不变。
+    返回 {'id': ..., 'item_id': ..., 'still_pending': bool}。
+    """
+    found_note = (found_note or "").strip()
+    if not found_note:
+        raise ValueError("复核说明不能为空")
+    ts = now_iso()
+    with immediate_tx(conn):
+        item = conn.execute(
+            "SELECT id, status FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if item is None:
+            raise LookupError("物品不存在")
+
+        # 先核验记录本身：存在、确属该物品、尚未解除（未解除记录在结构上不可能存在
+        # 于已交还/已并入物品，故跨物品提交时应精确报「记录与物品不匹配」）。
+        rec = conn.execute(
+            "SELECT id, item_id, resolved_at FROM item_not_found WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        if rec is None:
+            raise LookupError("暂未找到记录不存在")
+        if rec["item_id"] != item_id:
+            raise ValueError("暂未找到记录与该物品不匹配，不能解除")
+        if rec["resolved_at"] is not None:
+            raise ValueError("该暂未找到登记已解除，不能重复解除")
+
+        # 撤下期间允许解除；已交还 / 已并入不允许（正常流程不会到达，防御并发变化）。
+        if item["status"] in ("returned", "merged"):
+            raise ValueError("物品当前已交还或已并入，不能解除暂未找到登记")
+
+        cur = conn.execute(
+            "UPDATE item_not_found SET found_note = ?, resolved_at = ?"
+            " WHERE id = ? AND resolved_at IS NULL",
+            (found_note, ts, record_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("暂未找到登记已被解除（可能已被并发处理），解除未执行")
+        conn.execute(
+            "UPDATE items SET updated_at = ? WHERE id = ?",
+            (ts, item_id),
+        )
+        still_pending = item_has_pending_not_found(conn, item_id)
+    return {"id": record_id, "item_id": item_id, "still_pending": still_pending}
+
+
+def list_not_found_for_item(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
+    """物品的全部暂未找到登记与解除记录（仅工作人员追溯），按登记顺序。"""
+    return conn.execute(
+        "SELECT * FROM item_not_found WHERE item_id = ? ORDER BY id ASC",
         (item_id,),
     ).fetchall()

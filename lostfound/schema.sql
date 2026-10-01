@@ -85,3 +85,19 @@ CREATE TABLE IF NOT EXISTS return_revocations (
     created_at   TEXT    NOT NULL                              -- 撤销时间
 );
 CREATE INDEX IF NOT EXISTS idx_revocations_item ON return_revocations(item_id);
+
+-- 盘点「暂未找到」记录：工作人员盘点保管中物品暂未找到实物时，在物品详情页填写
+-- 必填原因登记。登记期间物品状态仍为 kept，但获选人凭证查询只显示「暂缓交还」提示、
+-- 不展示交还码，核码一律拒绝且不消耗原码；原获选资格、申请与码有效期均不变。
+-- 找到实物后工作人员填写必填复核说明，逐条解除（resolved_at 置位）。撤下再恢复
+-- 不清除该状态；合并时记录随申请/改判/撤销记录一并迁移到保留物品，保留物品在
+-- 全部未解除记录逐条复核完成前继续暂停交还。原因与时间仅供工作人员追溯。
+CREATE TABLE IF NOT EXISTS item_not_found (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id     INTEGER NOT NULL REFERENCES items(id),
+    reason      TEXT    NOT NULL,          -- 登记原因（必填，仅工作人员可见）
+    found_note  TEXT,                      -- 解除时的必填复核说明（仅工作人员可见）
+    created_at  TEXT    NOT NULL,          -- 登记时间
+    resolved_at TEXT                       -- 解除时间；NULL 表示尚未解除（暂缓交还中）
+);
+CREATE INDEX IF NOT EXISTS idx_notfound_item ON item_not_found(item_id);

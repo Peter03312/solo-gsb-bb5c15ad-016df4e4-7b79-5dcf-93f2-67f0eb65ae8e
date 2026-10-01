@@ -90,6 +90,7 @@ font-size:15px;padding:12px 14px;border-radius:8px;word-break:break-all;user-sel
 font-weight:700;background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;
 padding:10px;text-align:center;color:var(--ok)}
 .private{background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:12px 14px}
+.warnbox{background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:12px 14px;color:#92400e}
 dl.info{margin:0;font-size:14px}
 dl.info dt{color:var(--muted);font-size:12px;margin-top:8px}
 dl.info dd{margin:2px 0 0}
@@ -228,7 +229,17 @@ def query_result(
     ]
     extra = ""
     if status == "selected":
-        if active_code is not None and not active_code["consumed_at"] and not active_code["invalidated_at"]:
+        if claim["item_not_found"]:
+            # 物品盘点暂未找到实物：只显示暂缓交还提示，不展示交还码；
+            # 原获选资格、申请与码有效期保持不变。访客看不到任何内部原因。
+            extra += (
+                '<div class="card"><h1>交还暂缓</h1>'
+                '<p>工作人员盘点时暂未找到该物品实物，当前暂缓当面交还，请耐心等待工作人员'
+                "进一步通知；物品找到后本页会重新显示一次性交还码。</p>"
+                '<p class="muted">你的获选资格与申请保持不变，交还码有效期不受影响，'
+                "无需重新提交认领。</p></div>"
+            )
+        elif active_code is not None and not active_code["consumed_at"] and not active_code["invalidated_at"]:
             expires = active_code["expires_at"]
             if expires <= _now_iso():
                 extra += (
@@ -290,8 +301,9 @@ def staff_dashboard(items: list[Any], csrf_token: str) -> str:
     rows = "".join(
         "<tr><td>"
         f'<a href="/staff/items/{it["id"]}">#{it["id"]} {e(it["public_description"])}</a>'
-        f'</td><td>{item_badge(it["status"])}</td>'
-        f'<td>{it["pending_count"]} / {it["claim_count"]}</td>'
+        f'</td><td>{item_badge(it["status"])}'
+        + ('<span class="badge badge-removed">暂缓交还</span>' if it["not_found"] else "")
+        + f'</td><td>{it["pending_count"]} / {it["claim_count"]}</td>'
         f'<td>{fmt_time(it["created_at"])}</td></tr>'
         for it in items
     ) or '<tr><td colspan="4" class="muted">还没有登记物品。</td></tr>'
@@ -331,6 +343,7 @@ def staff_item_detail(
     merge_info: Any = None,
     return_info: Any = None,
     revocations: list[Any] | None = None,
+    not_found_records: list[Any] | None = None,
 ) -> str:
     actions = ""
     if item["status"] == "kept":
@@ -344,6 +357,8 @@ def staff_item_detail(
             f'<form method="post" action="/staff/items/{item["id"]}/restore">'
             f'{csrf_field(csrf_token)}<button class="btn secondary" type="submit">恢复为保管中</button></form>'
         )
+    not_found_records = not_found_records or []
+    not_found_pending = any(r["resolved_at"] is None for r in not_found_records)
     rows = ""
     for c in claims:
         rows += (
@@ -370,10 +385,20 @@ def staff_item_detail(
         else ""
     )
     merge_hist = _merges_card(merges or [])
+    nf_banner = (
+        '<div class="warnbox">该物品存在<strong>未解除的暂未找到登记</strong>，'
+        "当前<strong>暂停交还</strong>：获选人凭证只显示暂缓提示而不展示交还码，核码一律拒绝且不消耗原码；"
+        "获选资格、申请与码有效期保持不变。找到实物后请逐条填写复核说明解除。</div>"
+        if not_found_pending
+        else ""
+    )
+    nf_panel = _not_found_panel(item["id"], item["status"], not_found_records, csrf_token)
+    nf_hist = _not_found_card(not_found_records)
     body = f"""
     <div class="card">
       <h1>物品 #{item['id']} {item_badge(item['status'])}</h1>
       {merged_notice}
+      {nf_banner}
       <dl class="info">
         <dt>公开描述</dt><dd>{e(item['public_description'])}</dd>
         <dt>私密辨认特征</dt><dd><div class="private">{e(item['private_features'])}</div></dd>
@@ -381,13 +406,14 @@ def staff_item_detail(
       </dl>
       <div class="row">{actions}<a class="btn secondary" href="/staff">返回登记台</a></div>
     </div>
+    {nf_panel}
     {merge_card}
     {return_card}
     <div class="card">
       <h1>认领申请（含私密答案与联系方式，仅工作人员可见）</h1>
       <table><thead><tr><th>申请</th><th>状态</th><th>辨认答案</th><th>联系方式</th><th>提交时间</th></tr></thead>
       <tbody>{rows}</tbody></table>
-    </div>{corr_html}{revoc_html}{merge_hist}"""
+    </div>{corr_html}{revoc_html}{nf_hist}{merge_hist}"""
     return page(f"物品 #{item['id']}", body, staff=True, flash=flash)
 
 
@@ -535,6 +561,84 @@ def _revocations_card(revocations: list[Any]) -> str:
     </div>"""
 
 
+def _not_found_panel(
+    item_id: int, item_status: str, records: list[Any], csrf_token: str
+) -> str:
+    """盘点暂未找到面板：保管中可登记；未解除记录逐条填写复核说明解除。
+
+    撤下期间仍可解除（撤下再恢复不能清除未找到状态）；已交还 / 已并入不提供任何表单。
+    """
+    if item_status in ("returned", "merged"):
+        return ""
+    register = ""
+    if item_status == "kept":
+        register = f"""
+        <form method="post" action="/staff/items/{item_id}/not-found">
+          {csrf_field(csrf_token)}
+          <label for="nf_reason">未找到原因（必填，仅工作人员可见，供追溯）</label>
+          <textarea id="nf_reason" name="reason" required maxlength="2000"
+            placeholder="例如：B 区储物柜盘点未见实物，已查监控待定位"></textarea>
+          <div class="row"><button class="btn danger" type="submit"
+            onclick="return confirm('登记后该物品暂缓交还：获选人凭证不展示交还码，核码将被拒绝且不消耗原码；获选资格、申请与码有效期不变。确定？')">
+            登记暂未找到（暂缓交还）</button></div>
+        </form>
+        <p class="muted">仅保管中的物品可登记；已撤下、已交还、已并入的物品不能登记。
+        撤下再恢复不会清除未找到状态。</p>
+        """
+    pending = [r for r in records if r["resolved_at"] is None]
+    resolve_rows = ""
+    for r in pending:
+        resolve_rows += f"""
+        <div class="private">
+          <dl class="info">
+            <dt>暂未找到登记 #{r['id']}</dt><dd>登记于 {fmt_time(r['created_at'])}</dd>
+            <dt>登记原因</dt><dd>{e(r['reason'])}</dd>
+          </dl>
+          <form method="post" action="/staff/items/{item_id}/not-found/{r['id']}/resolve">
+            {csrf_field(csrf_token)}
+            <label for="nf_note_{r['id']}">复核说明（必填，找到实物后填写）</label>
+            <textarea id="nf_note_{r['id']}" name="found_note" required maxlength="2000"
+              placeholder="例如：已在相邻柜格找到实物并核对无误"></textarea>
+            <div class="row"><button class="btn" type="submit">找到实物 · 复核解除本条</button></div>
+          </form>
+        </div>
+        """
+    if not resolve_rows:
+        resolve_rows = '<p class="muted">当前没有未解除的暂未找到登记。</p>'
+    return f"""
+    <div class="card">
+      <h1>盘点暂未找到（暂缓交还，仅工作人员可见）</h1>
+      {register}
+      <h2>未解除记录（须逐条复核）</h2>
+      {resolve_rows}
+      <p class="muted">解除只针对本条记录；物品尚有其他未解除记录（含合并并入条带来的）时，
+      保留物品继续暂停交还，直至逐条复核解除。解除后未过期的原码重新可见、可核销，过期码按现有重发规则处理。</p>
+    </div>"""
+
+
+def _not_found_card(records: list[Any]) -> str:
+    """暂未找到登记 / 解除历史（仅工作人员可见）：原因、复核说明、登记与解除时间。"""
+    if not records:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<td>#{r['id']}</td>"
+        f"<td>{e(r['reason'])}</td>"
+        f"<td>{fmt_time(r['created_at'])}</td>"
+        f"<td>{e(r['found_note']) if r['found_note'] else '—'}</td>"
+        f"<td>{fmt_time(r['resolved_at']) if r['resolved_at'] else '未解除（暂缓交还中）'}</td>"
+        "</tr>"
+        for r in records
+    )
+    return f"""
+    <div class="card">
+      <h1>暂未找到登记记录（仅工作人员可见）</h1>
+      <table><thead><tr><th>登记</th><th>未找到原因</th><th>登记时间</th>
+      <th>复核说明</th><th>解除时间</th></tr></thead>
+      <tbody>{rows}</tbody></table>
+    </div>"""
+
+
 def staff_claim_detail(
     claim: Any,
     active_code: Any,
@@ -544,7 +648,15 @@ def staff_claim_detail(
     plain_code: str | None = None,
     sibling_claims: list[Any] | None = None,
     corrections: list[Any] | None = None,
+    not_found_pending: bool = False,
 ) -> str:
+    nf_banner = (
+        '<div class="warnbox"><strong>物品暂缓交还中：</strong>'
+        "该物品存在未解除的暂未找到登记，核码将被拒绝且不消耗原码；"
+        "原获选资格、申请与码有效期保持不变。找到实物并逐条复核解除后，原码（未过期时）恢复核销。</div>"
+        if not_found_pending
+        else ""
+    )
     select_btn = ""
     if claim["status"] == "pending" and claim["item_status"] == "kept":
         select_btn = (
@@ -574,6 +686,7 @@ def staff_claim_detail(
       </dl>
       <div class="row">{select_btn}<a class="btn secondary" href="/staff/items/{claim['item_id']}">返回物品</a></div>
     </div>
+    {nf_banner}
     <div class="card"><h1>一次性交还码</h1>{code_panel}</div>
     {rejudge_panel}{corr_html}"""
     return page(f"申请 #{claim['id']}", body, staff=True, flash=flash)

@@ -329,6 +329,7 @@ class App:
             corrections = repository.list_corrections_for_item(self.conn(), view_item_id)
             merges = repository.list_merges_for_item(self.conn(), iid)
             revocations = repository.list_return_revocations_for_item(self.conn(), view_item_id)
+            not_found_records = repository.list_not_found_for_item(self.conn(), view_item_id)
             merge_info = None
             merge_candidates = []
             return_info = None
@@ -347,6 +348,7 @@ class App:
                     merge_info=merge_info,
                     return_info=return_info,
                     revocations=revocations,
+                    not_found_records=not_found_records,
                 )
             )
 
@@ -369,6 +371,12 @@ class App:
 
         if m == "POST" and (parts := _match("/staff/items/{id}/revoke-return", p)):
             return self.revoke_return(req, int(parts[0]))
+
+        if m == "POST" and (parts := _match("/staff/items/{id}/not-found", p)):
+            return self.register_not_found(req, int(parts[0]))
+
+        if m == "POST" and (parts := _match("/staff/items/{id}/not-found/{rid}/resolve", p)):
+            return self.resolve_not_found(req, int(parts[0]), int(parts[1]))
 
         if m == "GET" and (parts := _match("/staff/claims/{id}", p)):
             return self.staff_claim(req, int(parts[0]), flash)
@@ -489,6 +497,43 @@ class App:
                    "原已核销码永久失效，新的一次性交还码已签发给当前获选人。"),
         )
 
+    def register_not_found(self, req: Request, item_id: int) -> Response:
+        if not self.check_csrf(req):
+            return self.bad_csrf()
+        reason = req.form().get("reason", "").strip()
+        if not reason:
+            return Response.redirect(f"/staff/items/{item_id}", ("err", "未找到原因不能为空。"))
+        if len(reason) > 2000:
+            return Response.redirect(f"/staff/items/{item_id}", ("err", "未找到原因超出长度限制。"))
+        try:
+            repository.register_not_found(self.conn(), item_id, reason)
+        except (ValueError, LookupError) as exc:  # 状态不符 / 重复登记：拒绝且不改动数据
+            return Response.redirect(f"/staff/items/{item_id}", ("err", str(exc)))
+        return Response.redirect(
+            f"/staff/items/{item_id}",
+            ("ok", "已登记暂未找到：物品暂缓交还，获选人凭证只显示暂缓提示而不展示交还码，"
+                   "核码将被拒绝且不消耗原码；获选资格、申请与码有效期保持不变。"),
+        )
+
+    def resolve_not_found(self, req: Request, item_id: int, record_id: int) -> Response:
+        if not self.check_csrf(req):
+            return self.bad_csrf()
+        found_note = req.form().get("found_note", "").strip()
+        if not found_note:
+            return Response.redirect(f"/staff/items/{item_id}", ("err", "复核说明不能为空。"))
+        if len(found_note) > 2000:
+            return Response.redirect(f"/staff/items/{item_id}", ("err", "复核说明超出长度限制。"))
+        try:
+            result = repository.resolve_not_found(self.conn(), item_id, record_id, found_note)
+        except (ValueError, LookupError) as exc:  # 记录不匹配 / 重复解除 / 条件变化：拒绝不改数据
+            return Response.redirect(f"/staff/items/{item_id}", ("err", str(exc)))
+        if result["still_pending"]:
+            msg = "已复核解除本条暂未找到登记；该物品仍有其他未解除记录，继续暂停交还，直至逐条复核解除。"
+        else:
+            msg = ("已找到实物并完成复核：暂缓交还已解除，未过期的原交还码重新可见、可核销；"
+                   "若原码已过期，仍按现有重发规则处理。")
+        return Response.redirect(f"/staff/items/{item_id}", ("ok", msg))
+
     def staff_claim(self, req: Request, claim_id: int, flash: Flash | None) -> Response:
         claim = repository.get_claim_with_context(self.conn(), claim_id)
         if claim is None:
@@ -496,12 +541,14 @@ class App:
         active = repository.get_active_code_for_claim(self.conn(), claim_id)
         siblings = repository.list_claims_for_item(self.conn(), claim["item_id"])
         corrections = repository.list_corrections_for_item(self.conn(), claim["item_id"])
+        not_found_pending = repository.item_has_pending_not_found(self.conn(), claim["item_id"])
         return self.html(
             render.staff_claim_detail(
                 claim, active, self.csrf_token(req), flash,
                 plain_code=self._plain_code(active),
                 sibling_claims=siblings,
                 corrections=corrections,
+                not_found_pending=not_found_pending,
             )
         )
 
